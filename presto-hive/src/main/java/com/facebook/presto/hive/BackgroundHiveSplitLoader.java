@@ -71,7 +71,7 @@ import static com.facebook.presto.hive.HiveColumnHandle.pathColumnHandle;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_BAD_DATA;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_INVALID_BUCKET_FILES;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_UNKNOWN_ERROR;
-import static com.facebook.presto.hive.HiveSessionProperties.isForceLocalScheduling;
+import static com.facebook.presto.hive.HiveSessionProperties.getNodeSelectionStrategy;
 import static com.facebook.presto.hive.HiveUtil.getFooterCount;
 import static com.facebook.presto.hive.HiveUtil.getHeaderCount;
 import static com.facebook.presto.hive.HiveUtil.getInputFormat;
@@ -321,7 +321,7 @@ public class BackgroundHiveSplitLoader
                         targetFilesystem,
                         inputFormat,
                         pathDomain,
-                        isForceLocalScheduling(session),
+                        getNodeSelectionStrategy(session),
                         s3SelectPushdownEnabled,
                         new HiveSplitPartitionInfo(storage, path.toUri(), partitionKeys, partitionName, partitionDataColumnCount, partition.getPartitionSchemaDifference(), Optional.empty()),
                         schedulerUsesHostAddresses);
@@ -354,7 +354,7 @@ public class BackgroundHiveSplitLoader
                 fs,
                 inputFormat,
                 pathDomain,
-                isForceLocalScheduling(session),
+                getNodeSelectionStrategy(session),
                 s3SelectPushdownEnabled,
                 new HiveSplitPartitionInfo(
                         storage,

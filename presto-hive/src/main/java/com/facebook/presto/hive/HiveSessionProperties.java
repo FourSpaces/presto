@@ -16,6 +16,7 @@ package com.facebook.presto.hive;
 import com.facebook.presto.orc.OrcWriteValidation.OrcWriteValidationMode;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.schedule.NodeSelectionStrategy;
 import com.facebook.presto.spi.session.PropertyMetadata;
 import com.google.common.collect.ImmutableList;
 import io.airlift.units.DataSize;
@@ -42,7 +43,7 @@ public final class HiveSessionProperties
 {
     private static final String IGNORE_TABLE_BUCKETING = "ignore_table_bucketing";
     private static final String BUCKET_EXECUTION_ENABLED = "bucket_execution_enabled";
-    private static final String FORCE_LOCAL_SCHEDULING = "force_local_scheduling";
+    private static final String NODE_SELECTION_STRATEGY = "node_selection_strategy";
     private static final String INSERT_EXISTING_PARTITIONS_BEHAVIOR = "insert_existing_partitions_behavior";
     private static final String ORC_BLOOM_FILTERS_ENABLED = "orc_bloom_filters_enabled";
     private static final String ORC_MAX_MERGE_DISTANCE = "orc_max_merge_distance";
@@ -129,11 +130,15 @@ public final class HiveSessionProperties
                         "Enable bucket-aware execution: only use a single worker per bucket",
                         hiveClientConfig.isBucketExecutionEnabled(),
                         false),
-                booleanProperty(
-                        FORCE_LOCAL_SCHEDULING,
-                        "Only schedule splits on workers colocated with data node",
-                        hiveClientConfig.isForceLocalScheduling(),
-                        false),
+                new PropertyMetadata<>(
+                        NODE_SELECTION_STRATEGY,
+                        "Node affinity selection strategy",
+                        VARCHAR,
+                        NodeSelectionStrategy.class,
+                        hiveClientConfig.getNodeSelectionStrategy(),
+                        false,
+                        value -> NodeSelectionStrategy.valueOf((String) value),
+                        NodeSelectionStrategy::toString),
                 new PropertyMetadata<>(
                         INSERT_EXISTING_PARTITIONS_BEHAVIOR,
                         "Behavior on insert existing partitions; this session property doesn't control behavior on insert existing unpartitioned table",
@@ -439,9 +444,9 @@ public final class HiveSessionProperties
         return session.getProperty(MAX_BUCKETS_FOR_GROUPED_EXECUTION, Integer.class);
     }
 
-    public static boolean isForceLocalScheduling(ConnectorSession session)
+    public static NodeSelectionStrategy getNodeSelectionStrategy(ConnectorSession session)
     {
-        return session.getProperty(FORCE_LOCAL_SCHEDULING, Boolean.class);
+        return session.getProperty(NODE_SELECTION_STRATEGY, NodeSelectionStrategy.class);
     }
 
     public static InsertExistingPartitionsBehavior getInsertExistingPartitionsBehavior(ConnectorSession session)

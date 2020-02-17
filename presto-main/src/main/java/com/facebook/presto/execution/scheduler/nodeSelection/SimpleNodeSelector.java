@@ -11,15 +11,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.facebook.presto.execution.scheduler;
+package com.facebook.presto.execution.scheduler.nodeSelection;
 
 import com.facebook.airlift.log.Logger;
 import com.facebook.presto.execution.NodeTaskMap;
 import com.facebook.presto.execution.RemoteTask;
+import com.facebook.presto.execution.scheduler.BucketNodeMap;
+import com.facebook.presto.execution.scheduler.NodeAssignmentStats;
+import com.facebook.presto.execution.scheduler.NodeMap;
+import com.facebook.presto.execution.scheduler.SplitPlacementResult;
 import com.facebook.presto.metadata.InternalNode;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.Split;
+import com.facebook.presto.spi.HostAddress;
 import com.facebook.presto.spi.PrestoException;
+import com.google.common.base.Function;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
 import com.google.common.collect.HashMultimap;
@@ -27,9 +33,10 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Multimap;
 import com.google.common.util.concurrent.ListenableFuture;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -39,11 +46,12 @@ import static com.facebook.presto.execution.scheduler.NodeScheduler.selectDistri
 import static com.facebook.presto.execution.scheduler.NodeScheduler.selectExactNodes;
 import static com.facebook.presto.execution.scheduler.NodeScheduler.selectNodes;
 import static com.facebook.presto.execution.scheduler.NodeScheduler.toWhenHasSplitQueueSpaceFuture;
+import static com.facebook.presto.execution.scheduler.nodeSelection.NodeSelectionUtils.sortedNodes;
+import static com.facebook.presto.spi.StandardErrorCode.NODE_SELECTION_NOT_SUPPORTED;
 import static com.facebook.presto.spi.StandardErrorCode.NO_NODES_AVAILABLE;
-import static com.google.common.base.Verify.verify;
-import static com.google.common.collect.Sets.newHashSet;
+import static com.facebook.presto.spi.schedule.NodeSelectionStrategy.HARD_AFFINITY;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
-import static java.util.stream.Collectors.toList;
 
 public class SimpleNodeSelector
         implements NodeSelector
@@ -111,50 +119,47 @@ public class SimpleNodeSelector
         NodeMap nodeMap = this.nodeMap.get().get();
         NodeAssignmentStats assignmentStats = new NodeAssignmentStats(nodeTaskMap, nodeMap, existingTasks);
 
-        ResettableRandomizedIterator<InternalNode> randomCandidates = getRandomCandidates(maxTasksPerStage, nodeMap, existingTasks);
+        NodeSelection randomNodeSelection = new RandomNodeSelection(nodeMap, includeCoordinator, minCandidates, maxTasksPerStage, existingTasks);
         Set<InternalNode> blockedExactNodes = new HashSet<>();
         boolean splitWaitingForAnyNode = false;
-        for (Split split : splits) {
-            randomCandidates.reset();
 
+        // todo identify if sorting will cause bottleneck
+        List<HostAddress> sortedCandidates = sortedNodes(nodeMap);
+        OptionalInt preferredNodeCount = OptionalInt.empty();
+        for (Split split : splits) {
             List<InternalNode> candidateNodes;
-            if (!split.isRemotelyAccessible()) {
-                candidateNodes = selectExactNodes(nodeMap, split.getAddresses(), includeCoordinator);
+            switch (split.getNodeSelectionStrategy()) {
+                case HARD_AFFINITY:
+                    candidateNodes = selectExactNodes(nodeMap, split.getPreferredNodes(sortedCandidates), includeCoordinator);
+                    break;
+                case SOFT_AFFINITY:
+                    candidateNodes = convertToInternalNode(nodeMap, split.getPreferredNodes(sortedCandidates));
+                    preferredNodeCount = OptionalInt.of(candidateNodes.size());
+                    candidateNodes = ImmutableList.<InternalNode>builder().addAll(candidateNodes).addAll(randomNodeSelection.pickNodes(split)).build();
+                    break;
+                case NO_PREFERENCE:
+                    candidateNodes = randomNodeSelection.pickNodes(split);
+                    break;
+                default:
+                    throw new PrestoException(NODE_SELECTION_NOT_SUPPORTED, format("Unsupported node selection strategy %s", split.getNodeSelectionStrategy()));
             }
-            else {
-                candidateNodes = selectNodes(minCandidates, randomCandidates);
-            }
+
             if (candidateNodes.isEmpty()) {
                 log.debug("No nodes available to schedule %s. Available nodes %s", split, nodeMap.getNodesByHost().keys());
                 throw new PrestoException(NO_NODES_AVAILABLE, "No nodes available to run query");
             }
 
-            InternalNode chosenNode = null;
-            int min = Integer.MAX_VALUE;
-
-            for (InternalNode node : candidateNodes) {
-                int totalSplitCount = assignmentStats.getTotalSplitCount(node);
-                if (totalSplitCount < min && totalSplitCount < maxSplitsPerNode) {
-                    chosenNode = node;
-                    min = totalSplitCount;
-                }
-            }
+            InternalNode chosenNode = chooseLeastBusyNode(candidateNodes, assignmentStats::getTotalSplitCount, preferredNodeCount, maxSplitsPerNode);
             if (chosenNode == null) {
-                // min is guaranteed to be MAX_VALUE at this line
-                for (InternalNode node : candidateNodes) {
-                    int totalSplitCount = assignmentStats.getQueuedSplitCountForStage(node);
-                    if (totalSplitCount < min && totalSplitCount < maxPendingSplitsPerTask) {
-                        chosenNode = node;
-                        min = totalSplitCount;
-                    }
-                }
+                chosenNode = chooseLeastBusyNode(candidateNodes, assignmentStats::getQueuedSplitCountForStage, preferredNodeCount, maxPendingSplitsPerTask);
             }
+
             if (chosenNode != null) {
                 assignment.put(chosenNode, split);
                 assignmentStats.addAssignedSplit(chosenNode);
             }
             else {
-                if (split.isRemotelyAccessible()) {
+                if (split.getNodeSelectionStrategy() != HARD_AFFINITY) {
                     splitWaitingForAnyNode = true;
                 }
                 // Exact node set won't matter, if a split is waiting for any node
@@ -174,29 +179,37 @@ public class SimpleNodeSelector
         return new SplitPlacementResult(blocked, assignment);
     }
 
-    private ResettableRandomizedIterator<InternalNode> getRandomCandidates(int limit, NodeMap nodeMap, List<RemoteTask> existingTasks)
-    {
-        List<InternalNode> existingNodes = existingTasks.stream()
-                .map(remoteTask -> nodeMap.getNodesByNodeId().get(remoteTask.getNodeId()))
-                // nodes may sporadically disappear from the nodeMap if the announcement is delayed
-                .filter(Objects::nonNull)
-                .collect(toList());
-
-        int alreadySelectedNodeCount = existingNodes.size();
-        int nodeCount = nodeMap.getNodesByNodeId().size();
-
-        if (alreadySelectedNodeCount < limit && alreadySelectedNodeCount < nodeCount) {
-            List<InternalNode> moreNodes =
-                    selectNodes(limit - alreadySelectedNodeCount, randomizedNodes(nodeMap, includeCoordinator, newHashSet(existingNodes)));
-            existingNodes.addAll(moreNodes);
-        }
-        verify(existingNodes.stream().allMatch(Objects::nonNull), "existingNodes list must not contain any nulls");
-        return new ResettableRandomizedIterator<>(existingNodes);
-    }
-
     @Override
     public SplitPlacementResult computeAssignments(Set<Split> splits, List<RemoteTask> existingTasks, BucketNodeMap bucketNodeMap)
     {
         return selectDistributionNodes(nodeMap.get().get(), nodeTaskMap, maxSplitsPerNode, maxPendingSplitsPerTask, splits, existingTasks, bucketNodeMap);
+    }
+
+    private static List<InternalNode> convertToInternalNode(NodeMap nodeMap, List<HostAddress> preferredNodes)
+    {
+        List<InternalNode> internalNodes = new ArrayList<>();
+        preferredNodes.forEach(node -> internalNodes.addAll(nodeMap.getNodesByHostAndPort().get(node)));
+        return ImmutableList.copyOf(internalNodes);
+    }
+
+    private static InternalNode chooseLeastBusyNode(List<InternalNode> candidateNodes, Function<InternalNode, Integer> splitCountProvider, OptionalInt preferredNodeCount, int maxSplitCount)
+    {
+        int min = Integer.MAX_VALUE;
+        InternalNode chosenNode = null;
+        for (int i = 0; i < candidateNodes.size(); i++) {
+            InternalNode node = candidateNodes.get(i);
+            int splitCount = splitCountProvider.apply(node);
+
+            // choose the preferred node first as long as they're not busy
+            if (preferredNodeCount.isPresent() && i < preferredNodeCount.getAsInt() && splitCount < maxSplitCount) {
+                return node;
+            }
+            // fallback to choosing the least busy nodes
+            if (splitCount < min && splitCount < maxSplitCount) {
+                chosenNode = node;
+                min = splitCount;
+            }
+        }
+        return chosenNode;
     }
 }
